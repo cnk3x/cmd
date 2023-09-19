@@ -1,157 +1,256 @@
 package cmd
 
 import (
-	"fmt"
+	"bufio"
+	"context"
+	"io"
+	"log"
 	"os"
 	"os/exec"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
-
-	"go.shu.run/log"
 )
 
-func New(args ...string) *C {
-	return &C{ar: args}
+func New(name string, args ...string) *Cmd {
+	return &Cmd{Executable: name, Args: args}
 }
 
-type C struct {
-	ar  []string
-	c   *exec.Cmd
-	pid int
-	ls  *os.ProcessState
+// 解析单行命令
+func Parse(commandLine string) *Cmd {
+	if args := parseCommandLine(commandLine); len(args) > 0 {
+		return New(args[0], args[1:]...)
+	}
+	return &Cmd{}
 }
 
-func (c *C) Command(args ...string) {
-	c.ar = args
+// 执行脚本，在windows使用`cmd /c`, unix使用`bash/sh -c`(优先bash)
+func Shell(command string, options ...Option) *Cmd {
+	name, args := shell(command)
+	return New(name, args...).With(options...)
 }
 
-func (c *C) Start() (err error) {
-	defer func() {
-		if re := recover(); re != nil {
-			err = fmt.Errorf("%v", re)
+type Cmd struct {
+	Name       string     //命令名称
+	Executable string     //执行文件
+	Args       []string   //参数
+	Env        []string   //环境变量
+	Dir        string     //执行目录
+	Stderr     logHandler //按行处理错误输出
+	Stdout     logHandler //按行处理标准输出
+
+	PidFile //指定PIDFile路径
+
+	options   Options           //选项
+	preStart  Options           //启动前
+	postStart func(*os.Process) //启动后
+
+	onStateChange func(s State) //onStateChange
+	onError       func(error)   //错误
+
+	done   <-chan struct{}
+	cancel context.CancelFunc
+	state  *State
+	states []*State
+	cmd    *exec.Cmd
+}
+
+// add options
+func (c *Cmd) With(options ...Option) *Cmd {
+	c.options = append(c.options, options...)
+	return c
+}
+
+// start the process
+func (c *Cmd) Start(ctx context.Context) *Cmd {
+	handleStateChange := func() {
+		if c.onStateChange != nil {
+			c.onStateChange(c.state.Clone())
 		}
-	}()
-	if len(c.ar) == 0 {
-		return fmt.Errorf("命令为空")
-	}
-	log.Infof("运行: %s", strings.Join(c.ar, " "))
-	c.c = exec.Command(c.ar[0], c.ar[1:]...)
-	c.c.Stderr = os.Stderr
-	c.c.Stdout = os.Stdout
-	c.c.Stdin = os.Stdin
-	c.c.SysProcAttr = newProcAttr()
-	return c.c.Start()
-}
-
-func (c *C) Run() {
-	defer func() {
-		if re := recover(); re != nil {
-			log.Errorf("%v", re)
-		}
-	}()
-
-	//杀进程
-	if err := c.Kill(); err != nil {
-		log.Debugf("杀死进程失败: %v", err)
 	}
 
-	//等待退出
-	if !c.WaitForExit() {
-		log.Debugf("等待进程退出超时")
-	}
+	c.state = &State{Status: StatusStarting, StartTime: time.Now()}
+	handleStateChange()
 
-	//重置状态
-	c.Reset()
+	var w sync.WaitGroup
+	ctx, c.cancel = context.WithCancel(ctx)
+	cmd := exec.Command(c.Executable, c.Args...)
+	cmd.SysProcAttr = &syscall.SysProcAttr{}
+	setPdeathsig(cmd.SysProcAttr, syscall.SIGKILL)
+	setPgid(cmd.SysProcAttr)
+	cmd.Dir = c.Dir
+	cmd.Env = append(os.Environ(), c.Env...)
+	c.cmd = cmd
 
-	//启动
-	if err := c.Start(); err != nil {
-		log.Errorf("执行命令失败: %v", err)
-		return
-	}
+	c.options.Apply(c)
 
-	//等待启动是否成功
-	if c.WaitForRun() {
-		log.Infof("已运行 PID: %d", c.Pid())
-	}
+	cmdDone := make(chan struct{})
+	realDone := make(chan struct{})
+	c.done = realDone
 
-	//等待执行完成
-	if err := c.Wait(); err != nil {
-		log.Infof("进程已完成: %v", err)
-	} else {
-		log.Infof("进程已完成")
-	}
-	c.ls = c.c.ProcessState
-	c.c = nil
-}
-
-func (c *C) WaitForRun() bool {
-	if c.pid = c.Pid(); c.pid > 0 {
-		return true
-	}
-
-	timeout := time.After(time.Second * 5)
-	for {
-		select {
-		case <-timeout:
-			return false
-		case <-time.After(10 * time.Millisecond):
-			if c.pid = c.Pid(); c.pid > 0 {
-				return true
+	handleExit := func(err error) {
+		defer close(cmdDone)
+		if err != nil {
+			c.state.Error = err.Error()
+			if c.onError != nil {
+				c.onError(err)
 			}
 		}
-	}
-}
 
-func (c *C) WaitForExit() bool {
-	if c.c == nil || c.ls != nil {
-		return true
+		var ps *os.ProcessState
+		c.state.ExitCode = cmd.ProcessState.ExitCode()
+		if ps = cmd.ProcessState; ps != nil {
+			c.state.UserTime = ps.UserTime()
+			c.state.SysTime = ps.SystemTime()
+			c.state.Success = ps.Success()
+		}
+		c.states = append(c.states, c.state)
+		c.state.Exited = true
+		c.state.ExitTime = time.Now()
+		c.state.Status = StatusStopped
+		handleStateChange()
 	}
 
-	timeout := time.After(time.Second * 5)
-	for {
-		select {
-		case <-timeout:
-			return false
-		case <-time.After(10 * time.Millisecond):
-			if c.c == nil || c.ls != nil {
-				return true
+	var stdout, stderr io.Reader
+	var err error
+
+	if !c.Stdout.IsEmpty() {
+		cmd.Stdout = nil
+		if stdout, err = cmd.StdoutPipe(); err != nil {
+			handleExit(err)
+			return c
+		}
+	}
+
+	if !c.Stderr.IsEmpty() {
+		cmd.Stderr = nil
+		if stderr, err = cmd.StderrPipe(); err != nil {
+			handleExit(err)
+			return c
+		}
+	}
+
+	c.preStart.Apply(c)
+	if err = cmd.Start(); err != nil {
+		handleExit(err)
+		return c
+	}
+	pid := cmd.Process.Pid
+
+	c.state.PID = pid
+	c.state.Status = StatusStarted
+	handleStateChange()
+
+	defer c.WritePid(pid).DelPid()
+
+	if c.postStart != nil {
+		c.postStart(cmd.Process)
+	}
+
+	readStd := func(std io.Reader, handle func(s string)) <-chan struct{} {
+		rDone := make(chan struct{})
+		w.Add(1)
+		go func() {
+			defer w.Done()
+			defer close(rDone)
+			if std != nil && handle != nil {
+				for s := bufio.NewScanner(std); s.Scan(); {
+					handle(s.Text())
+				}
 			}
+		}()
+		return rDone
+	}
+
+	//handleCancel
+	w.Add(1)
+	go func() {
+		defer w.Done()
+
+		select {
+		case <-cmdDone: //已经退出了
+			log.Println("[cancel] has done")
+			return
+		case <-ctx.Done():
+			c.state.Status = StatusStopping
+			handleStateChange()
+			log.Printf("[cancel] terminate: %d", pid)
+			terminate(pid)
 		}
+
+		//watch
+		w.Add(1)
+		go func() {
+			defer w.Done()
+			for i := 0; i < 3; i++ {
+				select {
+				case <-cmdDone:
+					return
+				case <-time.After(time.Second * 3):
+					log.Printf("[cancel] kill: %d", pid)
+					kill(pid)
+				}
+			}
+		}()
+	}()
+
+	//handleWait
+	w.Add(1)
+	go func() {
+		defer w.Done()
+		oDone := readStd(stdout, c.Stdout.handle)
+		eDone := readStd(stderr, c.Stderr.handle)
+		<-oDone
+		<-eDone
+		handleExit(cmd.Wait())
+	}()
+
+	go func() {
+		<-cmdDone
+		w.Wait()
+		close(realDone)
+	}()
+
+	return c
+}
+
+// Restart the process
+func (c *Cmd) Restart(ctx context.Context) {
+	c.Stop()
+	<-c.done
+	c.Start(ctx)
+}
+
+// Stop the process
+func (c *Cmd) Stop() {
+	if c.cancel != nil {
+		c.cancel()
 	}
 }
 
-func (c *C) Kill(signals ...syscall.Signal) error {
-	if pid := c.Pid(); pid > 0 {
-		if len(signals) > 0 {
-			return syscall.Kill(-pid, signals[0])
-		}
-		return syscall.Kill(-pid, syscall.SIGKILL)
+func (c *Cmd) Done() <-chan struct{} {
+	return c.done
+}
+
+func (c *Cmd) State() State {
+	return c.state.Clone()
+}
+
+func (c *Cmd) States() (states []State) {
+	states = make([]State, len(c.states))
+	for i, state := range c.states {
+		states[i] = state.Clone()
 	}
-	return nil
+	return
 }
 
-func (c *C) Wait() error {
-	if c.c != nil {
-		return c.c.Wait()
+func (c *Cmd) String() string {
+	b := new(strings.Builder)
+	b.WriteString(c.Executable)
+	for _, a := range c.Args {
+		b.WriteByte(' ')
+		b.WriteString(a)
 	}
-	return nil
-}
-
-func (c *C) Reset() {
-	//重置状态
-	c.ls = nil
-	c.pid = 0
-	c.c = nil
-}
-
-func (c *C) ProcessState() *os.ProcessState {
-	return c.ls
-}
-
-func (c *C) Pid() int {
-	if c.c != nil && c.c.Process != nil {
-		return c.c.Process.Pid
-	}
-	return 0
+	return b.String()
 }
