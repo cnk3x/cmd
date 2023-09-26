@@ -1,30 +1,24 @@
 package cmd
 
 import (
-	"context"
 	"log"
 	"testing"
 	"time"
+
+	"golang.org/x/text/encoding/simplifiedchinese"
 )
 
-var onStateChange = func(s State) {
-	log.Printf("[state] %s, startTime: %s, uptime: %s", s.Status, s.StartTime.Format(time.RFC3339), time.Since(s.StartTime))
-}
-
 func TestWindowsCmd(t *testing.T) {
-	c := Shell(`ls -lah && id -u && sleep 10s`).
-		With(Stderr(func(s string) { log.Printf("[%s] %s", "stderr", s) })).
-		With(Stdout(func(s string) { log.Printf("[%s] %s", "stdout", s) })).
-		With(Error(func(err error) { log.Printf("[%s] %v", "error", err) })).
-		With(User(1000, 1000)).
-		With(StateChange(onStateChange)).
-		Start(context.Background())
+	s := Shell(`dir`).With(User(1000, 1000)).
+		Stderr(func(s string) { t.Logf("[E] %s", s) }).
+		Stdout(func(s string) { t.Logf("[S] %s", s) }).
+		Transform(simplifiedchinese.GB18030.NewDecoder().Reader).
+		Start()
 
 	go func() {
 		<-time.After(time.Second)
-		c.Stop()
+		s.Cancel()
 	}()
 
-	<-c.Done()
-	log.Printf("[done]")
+	log.Printf("[done]: %v", s.Wait())
 }

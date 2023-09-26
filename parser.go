@@ -4,7 +4,7 @@ import (
 	"unicode"
 )
 
-func parseCommandLine(command string) (args []string) {
+func ParseCommandLine(command string) (args []string) {
 	cmdLen := len(command)
 	for i := 0; i < cmdLen; {
 		// find the first non-space char

@@ -4,7 +4,6 @@ import (
 	"bufio"
 	"context"
 	"io"
-	"log"
 	"os"
 	"os/exec"
 	"strings"
@@ -18,233 +17,163 @@ func New(name string, args ...string) *Cmd {
 }
 
 // 解析单行命令
-func Parse(commandLine string) *Cmd {
-	if args := parseCommandLine(commandLine); len(args) > 0 {
+func CommandLine(commandLine string) *Cmd {
+	if args := ParseCommandLine(commandLine); len(args) > 0 {
 		return New(args[0], args[1:]...)
 	}
 	return &Cmd{}
 }
 
 // 执行脚本，在windows使用`cmd /c`, unix使用`bash/sh -c`(优先bash)
-func Shell(command string, options ...Option) *Cmd {
+func Shell(command string) *Cmd {
 	name, args := shell(command)
-	return New(name, args...).With(options...)
+	return New(name, args...)
 }
 
 type Cmd struct {
-	Name       string     //命令名称
-	Executable string     //执行文件
-	Args       []string   //参数
-	Env        []string   //环境变量
-	Dir        string     //执行目录
-	Stderr     logHandler //按行处理错误输出
-	Stdout     logHandler //按行处理标准输出
+	Name       string   //命令名称
+	Executable string   //执行文件
+	Args       []string //参数
+	Env        []string //环境变量
+	Dir        string   //执行目录
+	PidFile    PidFile  //指定PIDFile路径
+	Options    Options  //选项
 
-	PidFile //指定PIDFile路径
+	stderr func(s string)            //按行处理错误输出
+	stdout func(s string)            //按行处理标准输出
+	ct     func(io.Reader) io.Reader //文本转换
+	ctx    context.Context
 
-	options   Options           //选项
-	preStart  Options           //启动前
-	postStart func(*os.Process) //启动后
-
-	onStateChange func(s State) //onStateChange
-	onError       func(error)   //错误
-
-	done   <-chan struct{}
-	cancel context.CancelFunc
-	state  *State
-	states []*State
-	cmd    *exec.Cmd
+	cmd *exec.Cmd
 }
 
 // add options
 func (c *Cmd) With(options ...Option) *Cmd {
-	c.options = append(c.options, options...)
+	c.Options = append(c.Options, options...)
 	return c
 }
 
-// start the process
-func (c *Cmd) Start(ctx context.Context) *Cmd {
-	handleStateChange := func() {
-		if c.onStateChange != nil {
-			c.onStateChange(c.state.Clone())
-		}
+func (c *Cmd) Context(ctx context.Context) *Cmd {
+	c.ctx = ctx
+	return c
+}
+
+// 设置命令行文本转换
+func (c *Cmd) Transform(ct func(io.Reader) io.Reader) *Cmd {
+	c.ct = ct
+	return c
+}
+
+// 设置错误行输出
+func (c *Cmd) Stderr(lineRd func(s string)) *Cmd {
+	c.stderr = lineRd
+	return c
+}
+
+// 设置标准行输出
+func (c *Cmd) Stdout(lineRd func(s string)) *Cmd {
+	c.stdout = lineRd
+	return c
+}
+
+// 启动进程
+func (c *Cmd) Start() (state *StartState) {
+	state = &StartState{}
+
+	var ctx context.Context
+	if ctx = c.ctx; ctx == nil {
+		ctx = context.Background()
 	}
 
-	c.state = &State{Status: StatusStarting, StartTime: time.Now()}
-	handleStateChange()
-
-	var w sync.WaitGroup
-	ctx, c.cancel = context.WithCancel(ctx)
+	ctx, state.cancel = context.WithCancel(ctx)
 	cmd := exec.Command(c.Executable, c.Args...)
-	cmd.SysProcAttr = &syscall.SysProcAttr{}
-	setPdeathsig(cmd.SysProcAttr, syscall.SIGKILL)
-	setPgid(cmd.SysProcAttr)
 	cmd.Dir = c.Dir
 	cmd.Env = append(os.Environ(), c.Env...)
+	cmd.SysProcAttr = &syscall.SysProcAttr{}
+	setPgid(cmd.SysProcAttr)
+
 	c.cmd = cmd
+	c.Options.Apply(c)
 
-	c.options.Apply(c)
+	var (
+		cmdDone = make(chan struct{})
+		allDone = make(chan struct{})
+		bgr     Parallel
+	)
 
-	cmdDone := make(chan struct{})
-	realDone := make(chan struct{})
-	c.done = realDone
+	state.done = allDone
 
-	handleExit := func(err error) {
-		defer close(cmdDone)
-		if err != nil {
-			c.state.Error = err.Error()
-			if c.onError != nil {
-				c.onError(err)
-			}
-		}
-
-		var ps *os.ProcessState
-		c.state.ExitCode = cmd.ProcessState.ExitCode()
-		if ps = cmd.ProcessState; ps != nil {
-			c.state.UserTime = ps.UserTime()
-			c.state.SysTime = ps.SystemTime()
-			c.state.Success = ps.Success()
-		}
-		c.states = append(c.states, c.state)
-		c.state.Exited = true
-		c.state.ExitTime = time.Now()
-		c.state.Status = StatusStopped
-		handleStateChange()
-	}
+	//all done
+	go func() {
+		<-cmdDone
+		bgr.Wait()
+		close(allDone)
+	}()
 
 	var stdout, stderr io.Reader
 	var err error
 
-	if !c.Stdout.IsEmpty() {
+	handleExit := func(err error) *StartState {
+		defer close(cmdDone)
+		state.Err = err
+		return state
+	}
+
+	if c.stdout != nil {
 		cmd.Stdout = nil
 		if stdout, err = cmd.StdoutPipe(); err != nil {
-			handleExit(err)
-			return c
+			return handleExit(err)
 		}
 	}
 
-	if !c.Stderr.IsEmpty() {
+	if c.stderr != nil {
 		cmd.Stderr = nil
 		if stderr, err = cmd.StderrPipe(); err != nil {
-			handleExit(err)
-			return c
+			return handleExit(err)
 		}
 	}
 
-	c.preStart.Apply(c)
 	if err = cmd.Start(); err != nil {
-		handleExit(err)
-		return c
+		return handleExit(err)
 	}
+
 	pid := cmd.Process.Pid
+	state.PID = pid
 
-	c.state.PID = pid
-	c.state.Status = StatusStarted
-	handleStateChange()
+	c.PidFile.WritePid(pid)
 
-	defer c.WritePid(pid).DelPid()
-
-	if c.postStart != nil {
-		c.postStart(cmd.Process)
-	}
-
-	readStd := func(std io.Reader, handle func(s string)) <-chan struct{} {
-		rDone := make(chan struct{})
-		w.Add(1)
-		go func() {
-			defer w.Done()
-			defer close(rDone)
-			if std != nil && handle != nil {
-				for s := bufio.NewScanner(std); s.Scan(); {
-					handle(s.Text())
-				}
-			}
-		}()
-		return rDone
-	}
-
-	//handleCancel
-	w.Add(1)
-	go func() {
-		defer w.Done()
-
+	//terminate when context done
+	bgr.Run(func() {
 		select {
-		case <-cmdDone: //已经退出了
-			log.Println("[cancel] has done")
+		case <-cmdDone:
 			return
 		case <-ctx.Done():
-			c.state.Status = StatusStopping
-			handleStateChange()
-			log.Printf("[cancel] terminate: %d", pid)
-			terminate(pid)
+			Terminate(pid, cmdDone)
+		}
+	})
+
+	//read console and wait done
+	bgr.Run(func() {
+		transformRd := func(r io.Reader) io.Reader {
+			if r == nil || c.ct == nil {
+				return r
+			}
+			return c.ct(r)
 		}
 
-		//watch
-		w.Add(1)
-		go func() {
-			defer w.Done()
-			for i := 0; i < 3; i++ {
-				select {
-				case <-cmdDone:
-					return
-				case <-time.After(time.Second * 3):
-					log.Printf("[cancel] kill: %d", pid)
-					kill(pid)
-				}
-			}
-		}()
-	}()
+		var liner Liner
+		liner.Read(transformRd(stdout), c.stdout)
+		liner.Read(transformRd(stderr), c.stderr)
+		liner.Wait()
 
-	//handleWait
-	w.Add(1)
-	go func() {
-		defer w.Done()
-		oDone := readStd(stdout, c.Stdout.handle)
-		eDone := readStd(stderr, c.Stderr.handle)
-		<-oDone
-		<-eDone
 		handleExit(cmd.Wait())
-	}()
+		c.PidFile.DelPid()
+	})
 
-	go func() {
-		<-cmdDone
-		w.Wait()
-		close(realDone)
-	}()
-
-	return c
-}
-
-// Restart the process
-func (c *Cmd) Restart(ctx context.Context) {
-	c.Stop()
-	<-c.done
-	c.Start(ctx)
-}
-
-// Stop the process
-func (c *Cmd) Stop() {
-	if c.cancel != nil {
-		c.cancel()
-	}
-}
-
-func (c *Cmd) Done() <-chan struct{} {
-	return c.done
-}
-
-func (c *Cmd) State() State {
-	return c.state.Clone()
-}
-
-func (c *Cmd) States() (states []State) {
-	states = make([]State, len(c.states))
-	for i, state := range c.states {
-		states[i] = state.Clone()
-	}
 	return
 }
 
+// 进程描述
 func (c *Cmd) String() string {
 	b := new(strings.Builder)
 	b.WriteString(c.Executable)
@@ -253,4 +182,86 @@ func (c *Cmd) String() string {
 		b.WriteString(a)
 	}
 	return b.String()
+}
+
+type StartState struct {
+	PID    int
+	Err    error
+	Status Status
+
+	done   chan struct{}
+	cancel context.CancelFunc
+}
+
+type Status string
+
+const (
+	StatusStarting Status = "starting"
+	StatusStarted  Status = "started"
+	StatusStopping Status = "stopping"
+	StatusStopped  Status = "stopped"
+)
+
+func (s *StartState) Done() <-chan struct{} {
+	return s.done
+}
+
+func (s *StartState) Cancel() {
+	s.cancel()
+}
+
+func (s *StartState) Wait() error {
+	<-s.done
+	return s.Err
+}
+
+// 并行运行，集中等待
+type Parallel struct{ wg sync.WaitGroup }
+
+func (p *Parallel) Wait()          { p.wg.Wait() }
+func (p *Parallel) Run(run func()) { p.wg.Add(1); go func() { defer p.wg.Done(); run() }() }
+
+// 按行读取，多个异步读取，集中等待
+type Liner struct{ p Parallel }
+
+func (l *Liner) Wait() { l.p.Wait() }
+func (l *Liner) Read(std io.Reader, handle func(s string)) {
+	l.p.Run(func() {
+		if std != nil && handle != nil {
+			for s := bufio.NewScanner(std); s.Scan(); {
+				handle(s.Text())
+			}
+		}
+	})
+}
+
+func waitTerminate(ctx context.Context, pid int, done <-chan struct{}) func() {
+	return func() {
+		select {
+		case <-done:
+			return
+		case <-ctx.Done():
+			Terminate(pid, done)
+		}
+	}
+}
+
+func Terminate(pid int, done <-chan struct{}) {
+	sysInterrupt(pid)
+
+	if done != nil {
+		select {
+		case <-done:
+			return
+		case <-time.After(time.Second * 3):
+			sysTerminate(pid)
+		}
+
+		select {
+		case <-done:
+			return
+		case <-time.After(time.Second * 2):
+			sysKill(pid)
+		}
+	}
 }
