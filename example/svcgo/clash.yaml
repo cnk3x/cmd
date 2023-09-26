@@ -1,0 +1,26 @@
+description: clash service
+command: "{base}/clash-linux-amd64 -d ."
+logger: "{base}/{name}.log"
+logger_options:
+  max_size: 5M
+  keep: 3
+after_started:
+  - iptables -t nat -F CLASH
+  - iptables -t nat -X CLASH
+  - iptables -t nat -N HLASH
+  - iptables -t nat -A HLASH -d 0.0.0.0/8 -j RETURN
+  - iptables -t nat -A HLASH -d 10.0.0.0/8 -j RETURN
+  - iptables -t nat -A HLASH -d 169.254.0.0/16 -j RETURN
+  - iptables -t nat -A HLASH -d 127.0.0.0/8 -j RETURN
+  - iptables -t nat -A HLASH -d 172.16.0.0/12 -j RETURN
+  - iptables -t nat -A HLASH -d 192.168.0.0/16 -j RETURN
+  - iptables -t nat -A HLASH -d 224.0.0.0/4 -j RETURN
+  - iptables -t nat -A HLASH -d 240.0.0.0/4 -j RETURN
+  - iptables -t nat -A HLASH -p tcp -j RETURN -m mark --mark 0xff
+  - iptables -t nat -A HLASH -p tcp -j REDIRECT --to-ports 7892
+  - iptables -t nat -D PREROUTING -p tcp -j HLASH
+  - iptables -t nat -A PREROUTING -p tcp -j HLASH
+before_exit:
+  - iptables -t nat -D PREROUTING -p tcp -j HLASH
+  - iptables -t nat -F CLASH
+  - iptables -t nat -X CLASH

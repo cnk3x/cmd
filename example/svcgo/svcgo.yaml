@@ -1,0 +1,8 @@
+description: '{name} service'
+command: '{base}/some.exe -arg0 value0 -arg1 "hello world"'
+env:
+    - HELLO=World
+logger: '{base}/{name}.log'
+logger_options:
+    max_size: 5MiB
+    keep: 3

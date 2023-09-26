@@ -76,13 +76,21 @@ func (c *Cmd) RunWithContext(ctx context.Context) (state *StartState) {
 		return state
 	}
 
+	var w sync.WaitGroup
+	//all done
+	go func() {
+		<-cmdDone
+		w.Wait()
+		close(allDone)
+	}()
+
 	c.cmd = cmd
 	c.Options.Apply(c)
 	if cmd.Err != nil {
 		return handleExit(cmd.Err)
 	}
 
-	if err := cmd.Start(); state.Err != nil {
+	if err := cmd.Start(); err != nil {
 		return handleExit(err)
 	}
 
@@ -91,8 +99,6 @@ func (c *Cmd) RunWithContext(ctx context.Context) (state *StartState) {
 
 	c.Pid.WritePid(pid)
 	c.PreExit.Append(c.Pid.DelPid)
-
-	var w sync.WaitGroup
 
 	//terminate when context done
 	bgRun(&w, waitTerminate(ctx, pid, cmdDone))
@@ -103,13 +109,6 @@ func (c *Cmd) RunWithContext(ctx context.Context) (state *StartState) {
 		handleExit(cmd.Wait())
 		c.PreExit.Run()
 	})
-
-	//all done
-	go func() {
-		<-cmdDone
-		w.Wait()
-		close(allDone)
-	}()
 
 	return
 }

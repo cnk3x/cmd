@@ -3,6 +3,7 @@ package cmd
 import (
 	"bufio"
 	"io"
+	"os"
 )
 
 type Option interface{ Apply(c *Cmd) error }
@@ -70,6 +71,11 @@ func Stdout(w io.WriteCloser) Option {
 		c.PreExit.Append(WrapClose(w))
 	})
 }
+
+var Standard = FOption(func(c *Cmd) {
+	c.cmd.Stdout = os.Stdout
+	c.cmd.Stderr = os.Stderr
+})
 
 func LineRead(lineRd func(flag, line string), transformers ...func(io.Reader) io.Reader) Option {
 
