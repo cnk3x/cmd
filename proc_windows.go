@@ -8,14 +8,12 @@ import (
 	"syscall"
 )
 
-type attr = syscall.SysProcAttr
-
 func shell(command string) (name string, args []string) {
 	return "cmd", []string{"/c", command}
 }
 
-func setUser(*attr, uint32, uint32) {}
-func setPgid(*attr)                 {}
+func setUser(*syscall.SysProcAttr, uint32, uint32) {}
+func setBg(attr *syscall.SysProcAttr)              { attr.HideWindow = true }
 
 func killPid(pid int) error {
 	return exec.Command("taskkill", "/f", "/t", "/pid", strconv.Itoa(pid)).Run()

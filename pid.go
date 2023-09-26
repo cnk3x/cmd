@@ -5,9 +5,9 @@ import (
 	"strconv"
 )
 
-type PidFile string
+type Pid string
 
-func (f PidFile) ReadPid() (pid int) {
+func (f Pid) ReadPid() (pid int) {
 	if f != "" {
 		data, _ := os.ReadFile(string(f))
 		pid, _ = strconv.Atoi(string(data))
@@ -15,20 +15,19 @@ func (f PidFile) ReadPid() (pid int) {
 	return
 }
 
-func (f PidFile) WritePid(pid int) PidFile {
+func (f Pid) WritePid(pid int) Pid {
 	if f != "" {
 		os.WriteFile(string(f), []byte(strconv.Itoa(pid)), 0666)
 	}
 	return f
 }
 
-func (f PidFile) DelPid() PidFile {
+func (f Pid) DelPid() {
 	if f != "" {
 		os.Remove(string(f))
 	}
-	return f
 }
 
-func (f *PidFile) SetPidFile(path string) {
-	*f = PidFile(path)
+func (f *Pid) SetPid(path string) {
+	*f = Pid(path)
 }

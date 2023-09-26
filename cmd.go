@@ -1,9 +1,7 @@
 package cmd
 
 import (
-	"bufio"
 	"context"
-	"io"
 	"os"
 	"os/exec"
 	"strings"
@@ -36,13 +34,11 @@ type Cmd struct {
 	Args       []string //参数
 	Env        []string //环境变量
 	Dir        string   //执行目录
-	PidFile    PidFile  //指定PIDFile路径
 	Options    Options  //选项
+	Pid                 //指定PIDFile路径
 
-	stderr func(s string)            //按行处理错误输出
-	stdout func(s string)            //按行处理标准输出
-	ct     func(io.Reader) io.Reader //文本转换
-	ctx    context.Context
+	PostStart Runner //启动后执行
+	PreExit   Runner //完成时执行
 
 	cmd *exec.Cmd
 }
@@ -53,122 +49,67 @@ func (c *Cmd) With(options ...Option) *Cmd {
 	return c
 }
 
-func (c *Cmd) Context(ctx context.Context) *Cmd {
-	c.ctx = ctx
-	return c
-}
-
-// 设置命令行文本转换
-func (c *Cmd) Transform(ct func(io.Reader) io.Reader) *Cmd {
-	c.ct = ct
-	return c
-}
-
-// 设置错误行输出
-func (c *Cmd) Stderr(lineRd func(s string)) *Cmd {
-	c.stderr = lineRd
-	return c
-}
-
-// 设置标准行输出
-func (c *Cmd) Stdout(lineRd func(s string)) *Cmd {
-	c.stdout = lineRd
-	return c
+func (c *Cmd) Run() (state *StartState) {
+	return c.RunWithContext(context.Background())
 }
 
 // 启动进程
-func (c *Cmd) Start() (state *StartState) {
+func (c *Cmd) RunWithContext(ctx context.Context) (state *StartState) {
 	state = &StartState{}
-
-	var ctx context.Context
-	if ctx = c.ctx; ctx == nil {
-		ctx = context.Background()
-	}
 
 	ctx, state.cancel = context.WithCancel(ctx)
 	cmd := exec.Command(c.Executable, c.Args...)
 	cmd.Dir = c.Dir
 	cmd.Env = append(os.Environ(), c.Env...)
 	cmd.SysProcAttr = &syscall.SysProcAttr{}
-	setPgid(cmd.SysProcAttr)
-
-	c.cmd = cmd
-	c.Options.Apply(c)
+	setBg(cmd.SysProcAttr)
 
 	var (
 		cmdDone = make(chan struct{})
 		allDone = make(chan struct{})
-		bgr     Parallel
 	)
 
 	state.done = allDone
-
-	//all done
-	go func() {
-		<-cmdDone
-		bgr.Wait()
-		close(allDone)
-	}()
-
-	var stdout, stderr io.Reader
-	var err error
-
 	handleExit := func(err error) *StartState {
 		defer close(cmdDone)
 		state.Err = err
 		return state
 	}
 
-	if c.stdout != nil {
-		cmd.Stdout = nil
-		if stdout, err = cmd.StdoutPipe(); err != nil {
-			return handleExit(err)
-		}
+	c.cmd = cmd
+	c.Options.Apply(c)
+	if cmd.Err != nil {
+		return handleExit(cmd.Err)
 	}
 
-	if c.stderr != nil {
-		cmd.Stderr = nil
-		if stderr, err = cmd.StderrPipe(); err != nil {
-			return handleExit(err)
-		}
-	}
-
-	if err = cmd.Start(); err != nil {
+	if err := cmd.Start(); state.Err != nil {
 		return handleExit(err)
 	}
 
 	pid := cmd.Process.Pid
 	state.PID = pid
 
-	c.PidFile.WritePid(pid)
+	c.Pid.WritePid(pid)
+	c.PreExit.Append(c.Pid.DelPid)
+
+	var w sync.WaitGroup
 
 	//terminate when context done
-	bgr.Run(func() {
-		select {
-		case <-cmdDone:
-			return
-		case <-ctx.Done():
-			Terminate(pid, cmdDone)
-		}
-	})
+	bgRun(&w, waitTerminate(ctx, pid, cmdDone))
 
 	//read console and wait done
-	bgr.Run(func() {
-		transformRd := func(r io.Reader) io.Reader {
-			if r == nil || c.ct == nil {
-				return r
-			}
-			return c.ct(r)
-		}
-
-		var liner Liner
-		liner.Read(transformRd(stdout), c.stdout)
-		liner.Read(transformRd(stderr), c.stderr)
-		liner.Wait()
-
+	bgRun(&w, func() {
+		c.PostStart.Run()
 		handleExit(cmd.Wait())
-		c.PidFile.DelPid()
+		c.PreExit.Run()
 	})
+
+	//all done
+	go func() {
+		<-cmdDone
+		w.Wait()
+		close(allDone)
+	}()
 
 	return
 }
@@ -189,7 +130,7 @@ type StartState struct {
 	Err    error
 	Status Status
 
-	done   chan struct{}
+	done   <-chan struct{}
 	cancel context.CancelFunc
 }
 
@@ -211,28 +152,8 @@ func (s *StartState) Cancel() {
 }
 
 func (s *StartState) Wait() error {
-	<-s.done
+	<-s.Done()
 	return s.Err
-}
-
-// 并行运行，集中等待
-type Parallel struct{ wg sync.WaitGroup }
-
-func (p *Parallel) Wait()          { p.wg.Wait() }
-func (p *Parallel) Run(run func()) { p.wg.Add(1); go func() { defer p.wg.Done(); run() }() }
-
-// 按行读取，多个异步读取，集中等待
-type Liner struct{ p Parallel }
-
-func (l *Liner) Wait() { l.p.Wait() }
-func (l *Liner) Read(std io.Reader, handle func(s string)) {
-	l.p.Run(func() {
-		if std != nil && handle != nil {
-			for s := bufio.NewScanner(std); s.Scan(); {
-				handle(s.Text())
-			}
-		}
-	})
 }
 
 func waitTerminate(ctx context.Context, pid int, done <-chan struct{}) func() {
@@ -265,3 +186,5 @@ func Terminate(pid int, done <-chan struct{}) {
 		}
 	}
 }
+
+func bgRun(wg *sync.WaitGroup, run func()) { wg.Add(1); go func() { run(); wg.Done() }() }

@@ -18,7 +18,7 @@ func shell(command string) (name string, args []string) {
 	return name, []string{"-c", command}
 }
 
-func setPgid(attr *attr) { attr.Setpgid = true }
+func setBg(attr *attr) { attr.Setpgid = true }
 
 func setUser(attr *attr, uid uint32, gid uint32) {
 	if u, err := user.Current(); err == nil {
