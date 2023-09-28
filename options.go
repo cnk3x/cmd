@@ -4,81 +4,123 @@ import (
 	"bufio"
 	"io"
 	"os"
+	"os/exec"
+	"path/filepath"
+	"strings"
 )
 
-type Option interface{ Apply(c *Cmd) error }
-type FOption func(c *Cmd)
-type FOptionEx func(c *Cmd) error
+type Option interface{ Apply(cmd *exec.Cmd) error }
+type FOption func(cmd *exec.Cmd)
+type FOptionEx func(cmd *exec.Cmd) error
 type Options []Option
 
-func (f FOption) Apply(c *Cmd) error   { f(c); return nil }
-func (f FOptionEx) Apply(c *Cmd) error { return f(c) }
-func (options Options) Apply(c *Cmd) {
+func (f FOption) Apply(cmd *exec.Cmd) error   { f(cmd); return nil }
+func (f FOptionEx) Apply(cmd *exec.Cmd) error { return f(cmd) }
+func (options Options) Apply(cmd *exec.Cmd) {
 	for _, option := range options {
-		if c.cmd.Err != nil {
+		if cmd.Err != nil {
 			return
 		}
-		option.Apply(c)
+		option.Apply(cmd)
 	}
 }
 
 func User(uid, pid uint32) Option {
-	return FOption(func(c *Cmd) { setUser(c.cmd.SysProcAttr, uid, pid) })
-}
-
-func PidFile(pidfile string) Option {
-	return FOption(func(c *Cmd) { c.Pid = Pid(pidfile) })
+	return FOption(func(c *exec.Cmd) { setUser(c.SysProcAttr, uid, pid) })
 }
 
 func Envs(envs []string) Option {
-	return FOption(func(c *Cmd) { c.Env = envs })
+	return FOption(func(c *exec.Cmd) { c.Env = envs })
 }
 
 func WorkDir(workDir string) Option {
-	return FOption(func(c *Cmd) { c.Dir = workDir })
+	return FOption(func(c *exec.Cmd) { c.Dir = workDir })
 }
 
-func PreExit(task func(c *Cmd), parallel ...bool) Option {
-	return FOption(func(c *Cmd) {
-		c.PreExit.Append(func() { task(c) }, parallel...)
-	})
+func (c *Cmd) PreExit(task func(c *Cmd), parallel ...bool) *Cmd {
+	c.postStart.Append(func() { task(c) }, parallel...)
+	return c
 }
 
-func PostStart(task func(c *Cmd), parallel ...bool) Option {
-	return FOption(func(c *Cmd) {
-		c.PostStart.Append(func() { task(c) }, parallel...)
-	})
+func (c *Cmd) PostStart(task func(c *Cmd), parallel ...bool) *Cmd {
+	c.postStart.Append(func() { task(c) }, parallel...)
+	return c
 }
 
-func Logger(w io.WriteCloser) Option {
-	return FOption(func(c *Cmd) {
-		c.cmd.Stderr = w
-		c.cmd.Stdout = w
-		c.PreExit.Append(WrapClose(w))
-	})
+func (c *Cmd) PidFile(pidfile string) *Cmd {
+	c.pid = Pid(pidfile)
+	return c
 }
 
-func Stderr(w io.WriteCloser) Option {
-	return FOption(func(c *Cmd) {
-		c.cmd.Stderr = w
-		c.PreExit.Append(WrapClose(w))
-	})
+func (c *Cmd) Logger(options LoggerOptions) *Cmd {
+	if options.Path == "std" {
+		options.Std = true
+		options.Path = ""
+	}
+
+	create := func(std io.WriteCloser, path string) io.Writer {
+		var w io.Writer
+		if options.Std {
+			w = std
+		}
+
+		if path != "" {
+			options.Path = path
+			rotate := Rotate(options)
+
+			if w != nil {
+				w = io.MultiWriter(w, rotate)
+			} else {
+				w = rotate
+			}
+			c.preExit.Parallel(WrapClose(rotate))
+		}
+
+		return w
+	}
+
+	return c.With(FOption(func(cmd *exec.Cmd) {
+		if options.Path != "" {
+			ext := filepath.Ext(options.Path)
+			outPath := options.Path
+			errPath := strings.TrimSuffix(options.Path, ext) + "-err" + ext
+
+			cmd.Stdout = create(os.Stdout, outPath)
+			cmd.Stderr = create(os.Stderr, errPath)
+		}
+	}))
 }
 
-func Stdout(w io.WriteCloser) Option {
-	return FOption(func(c *Cmd) {
-		c.cmd.Stdout = w
-		c.PreExit.Append(WrapClose(w))
-	})
+func (c *Cmd) Standard() *Cmd {
+	return c.With(FOption(func(c *exec.Cmd) {
+		c.Stdout = os.Stdout
+		c.Stderr = os.Stderr
+	}))
 }
 
-var Standard = FOption(func(c *Cmd) {
-	c.cmd.Stdout = os.Stdout
-	c.cmd.Stderr = os.Stderr
-})
+func (c *Cmd) Stderr(w io.WriteCloser) *Cmd {
+	c.preExit.Parallel(WrapClose(w))
+	return c.With(FOption(func(cmd *exec.Cmd) {
+		cmd.Stderr = w
+	}))
+}
 
-func LineRead(lineRd func(flag, line string), transformers ...func(io.Reader) io.Reader) Option {
+func (c *Cmd) Stdout(w io.WriteCloser) *Cmd {
+	c.preExit.Parallel(WrapClose(w))
+	return c.With(FOption(func(cmd *exec.Cmd) {
+		cmd.Stdout = os.Stdout
+	}))
+}
 
+func (c *Cmd) LoggerWriter(w io.WriteCloser) *Cmd {
+	c.preExit.Append(WrapClose(w))
+	return c.With(FOption(func(cmd *exec.Cmd) {
+		cmd.Stderr = w
+		cmd.Stdout = w
+	}))
+}
+
+func (c *Cmd) LineRead(lineRd func(flag, line string), transformers ...func(io.Reader) io.Reader) *Cmd {
 	// 按行读取
 	startLineRead := func(std io.Reader, handle func(s string)) func() {
 		return func() {
@@ -90,28 +132,28 @@ func LineRead(lineRd func(flag, line string), transformers ...func(io.Reader) io
 		}
 	}
 
-	return FOptionEx(func(c *Cmd) error {
-		c.cmd.Stdout = nil
-		stdout, err := c.cmd.StdoutPipe()
+	return c.With(FOptionEx(func(cmd *exec.Cmd) error {
+		cmd.Stdout = nil
+		stdout, err := cmd.StdoutPipe()
 		if err != nil {
 			return err
 		}
 		for _, transformer := range transformers {
 			stdout = io.NopCloser(transformer(stdout))
 		}
-		c.PostStart.Parallel(startLineRead(stdout, func(s string) { lineRd("-", s) }))
+		c.postStart.Parallel(startLineRead(stdout, func(s string) { lineRd("-", s) }))
 
-		c.cmd.Stderr = nil
-		stderr, err := c.cmd.StderrPipe()
+		cmd.Stderr = nil
+		stderr, err := cmd.StderrPipe()
 		if err != nil {
 			return err
 		}
 		for _, transformer := range transformers {
 			stderr = io.NopCloser(transformer(stderr))
 		}
-		c.PostStart.Parallel(startLineRead(stderr, func(s string) { lineRd("-", s) }))
+		c.postStart.Parallel(startLineRead(stderr, func(s string) { lineRd("-", s) }))
 		return nil
-	})
+	}))
 }
 
 func WrapClose(closers ...io.Closer) func() {

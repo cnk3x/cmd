@@ -14,31 +14,35 @@ import (
 	"time"
 )
 
-func Rotate(options RotateOptions) io.WriteCloser {
-	return options.Create()
+func Rotate(options LoggerOptions) io.WriteCloser {
+	if minSize := FileSize(1 << 20); options.MaxSize < minSize {
+		options.MaxSize = minSize
+	}
+	if maxSize := FileSize(100 << 20); options.MaxSize > maxSize {
+		options.MaxSize = maxSize
+	}
+	if options.Keep < 0 && options.Keep != -1 {
+		options.Keep = 0
+	}
+	return &rotateWriter{
+		Path:    options.Path,
+		MaxSize: int(options.MaxSize),
+		Keep:    options.Keep,
+	}
 }
 
-type RotateOptions struct {
+type LoggerOptions struct {
+	Std     bool     `json:"std"`
 	Path    string   `json:"path"`
 	MaxSize FileSize `json:"max_size" yaml:"max_size"` //默认1M，最大100M
 	Keep    int      `json:"keep"`                     //0, 不保留, -1, 保留所有
 }
 
-func (rotate RotateOptions) Create() io.WriteCloser {
-	if minSize := FileSize(1 << 20); rotate.MaxSize < minSize {
-		rotate.MaxSize = minSize
-	}
-	if maxSize := FileSize(100 << 20); rotate.MaxSize > maxSize {
-		rotate.MaxSize = maxSize
-	}
-	if rotate.Keep < 0 && rotate.Keep != -1 {
-		rotate.Keep = 0
-	}
-	return &rotateWriter{cfg: rotate}
-}
-
 type rotateWriter struct {
-	cfg     RotateOptions
+	Path    string
+	MaxSize int //默认1M，最大100M
+	Keep    int //0, 不保留, -1, 保留所有
+
 	current *os.File
 	size    int
 	err     error
@@ -58,7 +62,7 @@ func (r *rotateWriter) Write(p []byte) (n int, err error) {
 		return
 	}
 	r.size += n
-	if r.size >= int(r.cfg.MaxSize) {
+	if r.size >= int(r.MaxSize) {
 		if err = r.rotate(); err != nil {
 			return
 		}
@@ -79,11 +83,11 @@ func (r *rotateWriter) Close() (err error) {
 }
 
 func (r *rotateWriter) open() (err error) {
-	if err = os.MkdirAll(filepath.Dir(r.cfg.Path), 0755); err != nil {
+	if err = os.MkdirAll(filepath.Dir(r.Path), 0755); err != nil {
 		return
 	}
 
-	if r.current, err = os.OpenFile(r.cfg.Path, os.O_RDWR|os.O_CREATE|os.O_APPEND, 0666); err != nil {
+	if r.current, err = os.OpenFile(r.Path, os.O_RDWR|os.O_CREATE|os.O_APPEND, 0666); err != nil {
 		return
 	}
 
@@ -96,24 +100,24 @@ func (r *rotateWriter) rotate() (err error) {
 		return
 	}
 
-	if r.cfg.Keep == 0 {
-		if err = os.Remove(r.cfg.Path); err != nil {
+	if r.Keep == 0 {
+		if err = os.Remove(r.Path); err != nil {
 			return
 		}
 	} else {
 		var (
-			dir, fname = filepath.Split(r.cfg.Path)
+			dir, fname = filepath.Split(r.Path)
 			ext        = filepath.Ext(fname)
 			name       = strings.TrimSuffix(fname, ext)
 			now        = time.Now().Format("20060102-150405")
 			fpath      = filepath.Join(dir, fmt.Sprintf("%s-%s%s", name, now, ext))
 		)
 
-		if err = os.Rename(r.cfg.Path, fpath); err != nil {
+		if err = os.Rename(r.Path, fpath); err != nil {
 			return
 		}
 
-		if r.cfg.Keep > 0 {
+		if r.Keep > 0 {
 			matches, e := filepath.Glob(filepath.Join(dir, fmt.Sprintf("%s-*%s", name, ext)))
 			if e != nil {
 				err = e
@@ -121,7 +125,7 @@ func (r *rotateWriter) rotate() (err error) {
 			}
 			sort.Strings(matches)
 			for i, n := range matches {
-				if i < r.cfg.Keep {
+				if i < r.Keep {
 					continue
 				}
 				_ = os.Remove(n) //删除失败不报错
